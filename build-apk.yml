@@ -1,0 +1,106 @@
+name: Build DAY17 APK
+
+on:
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Все ZIP из корня распаковываются по порядку имён (LC_ALL=C):
+      #   day-17.zip (база), затем patch-001.zip, patch-002.zip ... поверх с заменой файлов.
+      - name: Unpack ZIPs (base + patches)
+        run: |
+          mkdir -p _unpacked
+          export LC_ALL=C
+          for z in $(ls -1 *.zip 2>/dev/null | sort); do
+            echo "Unpacking $z"
+            unzip -oq "$z" -d _unpacked
+          done
+          PG=$(find _unpacked -name project.godot -print -quit)
+          if [ -z "$PG" ]; then PG=$(find . -name project.godot -not -path './.git/*' -print -quit); fi
+          if [ -z "$PG" ]; then echo "project.godot not found"; exit 1; fi
+          echo "PROJECT_DIR=$(dirname "$PG")" >> $GITHUB_ENV
+          echo "Project dir: $(dirname "$PG")"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK parts
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "build-tools;34.0.0" "platforms;android-34" || true
+
+      - uses: chickensoft-games/setup-godot@v2
+        with:
+          version: 4.3.0
+          use-dotnet: false
+          include-templates: true
+
+      # Версия: код растёт со временем -> Android ставит поверх без удаления.
+      - name: Stamp version
+        run: |
+          CODE=$(( $(date +%s) / 60 ))
+          sed -i "s|^version/code=.*|version/code=$CODE|" "$PROJECT_DIR/export_presets.cfg"
+          sed -i "s|^version/name=.*|version/name=\"0.${{ github.run_number }}\"|" "$PROJECT_DIR/export_presets.cfg"
+          echo "{\"build\": ${{ github.run_number }}, \"repo\": \"${{ github.repository }}\"}" > "$PROJECT_DIR/version.json"
+          cat "$PROJECT_DIR/version.json"
+
+      # Один и тот же ключ подписи (signing/day17.keystore из ZIP) -> обновление ставится поверх.
+      - name: Configure Godot Android export
+        run: |
+          KS="$GITHUB_WORKSPACE/$PROJECT_DIR/signing/day17.keystore"
+          KU=day17
+          KP=day17pass
+          if [ ! -f "$KS" ]; then
+            echo "::warning::signing/day17.keystore не найден — создан временный ключ, обновление поверх не получится"
+            KS="$HOME/tmp.keystore"; KU=androiddebugkey; KP=android
+            keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android -keystore "$KS" -storepass android -dname "CN=Android Debug,O=Android,C=US" -validity 9999 -deststoretype pkcs12
+          fi
+          mkdir -p ~/.config/godot
+          for f in editor_settings-4.tres editor_settings-4.3.tres; do
+            {
+              echo '[gd_resource type="EditorSettings" format=3]'
+              echo ''
+              echo '[resource]'
+              echo "export/android/android_sdk_path = \"$ANDROID_HOME\""
+              echo "export/android/java_sdk_path = \"$JAVA_HOME\""
+              echo "export/android/debug_keystore = \"$KS\""
+              echo "export/android/debug_keystore_user = \"$KU\""
+              echo "export/android/debug_keystore_pass = \"$KP\""
+            } > ~/.config/godot/$f
+          done
+          cat ~/.config/godot/editor_settings-4.3.tres
+
+      - name: Import project
+        run: godot --headless --path "$PROJECT_DIR" --import || true
+
+      - name: Export APK
+        run: |
+          mkdir -p build
+          godot --headless --path "$PROJECT_DIR" --export-debug "Android" "$GITHUB_WORKSPACE/build/DAY17.apk"
+          ls -la build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DAY17-apk
+          path: build/DAY17.apk
+
+      - name: Publish release with APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: DAY17 build ${{ github.run_number }}
+          files: build/DAY17.apk
+          make_latest: true
